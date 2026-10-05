@@ -7,6 +7,6 @@ def back_func(*args):
 if __name__ == '__main__':
     model = nt.InitModel()
     model.CreateModel([128, 64, 16])
-    train = nt.TrainModel(model, 2, 5, 0.5, 0.5, winner_func = gamer.checkInput)
-    model.model = train.train()
+    train = nt.TrainModel(model, 10, 5, 0.5, 0.5, winner_func = gamer.checkInput)
+    model = train.train()
     model.SaveModel("./", "test", {"info" : "test"})

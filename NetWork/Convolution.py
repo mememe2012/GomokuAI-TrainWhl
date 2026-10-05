@@ -32,11 +32,37 @@ class ConvOpe:
         """
         Convolution operation for all kernels
         """
-        result = []
-        for array in self.arrays:
-            for kernel in self.kernels:
-                result.append(self.opeOne(array, kernel))
-        return result
+        arrays = np.asarray(self.arrays)
+        kernels = np.asarray(self.kernels)
+        if arrays.ndim not in (3, 4) or kernels.ndim != 3:
+            raise ValueError(
+                "Convolution expects arrays with shape (channels, height, width) "
+                "or (batch, channels, height, width), and kernels with shape "
+                "(kernels, height, width)."
+            )
+
+        kernel_height, kernel_width = kernels.shape[-2:]
+        padded = np.pad(
+            arrays,
+            ((0, 0),) * (arrays.ndim - 2)
+            + (
+                (kernel_height // 2, kernel_height // 2),
+                (kernel_width // 2, kernel_width // 2),
+            ),
+            mode="constant",
+        )
+        windows = np.lib.stride_tricks.sliding_window_view(
+            padded, (kernel_height, kernel_width), axis=(-2, -1)
+        )
+
+        if arrays.ndim == 3:
+            result = np.einsum("nhwkl,ckl->nchw", windows, kernels, optimize=True)
+            return result.reshape(-1, *result.shape[-2:])
+
+        result = np.einsum("bnhwkl,ckl->bnchw", windows, kernels, optimize=True)
+        return result.reshape(
+            arrays.shape[0], -1, *result.shape[-2:]
+        )
 
 def view1D(array:np.array):
     length = 1
@@ -50,27 +76,35 @@ def pooling(arrays:np.array, pool_size:int = 2, mode:str = 'average'):
         - mode = average or max
         - every pool = (pool_size, pool_size)
         """
-        result = []
-        for array in arrays:
-            if array.shape[0] % pool_size != 0:
-                pad_size = pool_size - array.shape[0] % pool_size
-                array = np.pad(array, ((0, pad_size), (0, pad_size)), 'constant')
+        if pool_size < 1:
+            raise ValueError("pool_size must be at least 1.")
+        if mode not in ("average", "max"):
+            CONSOLE.print(f'Error: Invalid mode\n- mode must be "average" or "max", "{mode}" given.', style='bold red')
+            return
 
-            if mode == 'average':
-                temp = np.zeros((array.shape[0]//pool_size, array.shape[1]//pool_size))
-                for i in range(array.shape[0]//pool_size):
-                    for j in range(array.shape[1]//pool_size):
-                        temp[i, j] = np.average(array[i*pool_size:i*pool_size+pool_size, j*pool_size:j*pool_size+pool_size])
-                result.append(temp)
-            elif mode == 'max':
-                temp = np.zeros((array.shape[0]//pool_size, array.shape[1]//pool_size))
-                for i in range(array.shape[0]//pool_size):
-                    for j in range(array.shape[1]//pool_size):
-                        temp[i, j] = np.max(array[i*pool_size:i*pool_size+pool_size, j*pool_size:j*pool_size+pool_size])
-                result.append(temp)
-            else:
-                CONSOLE.print(f'Error: Invalid mode\n- mode must be "average" or "max", "{mode}" given.', style='bold red')
-                return
-            
-        result = np.array(result)
-        return result
+        arrays = np.asarray(arrays)
+        if arrays.ndim not in (3, 4):
+            raise ValueError(
+                "Pooling expects arrays with shape (channels, height, width) "
+                "or (batch, channels, height, width)."
+            )
+
+        height, width = arrays.shape[-2:]
+        pad_height = (-height) % pool_size
+        pad_width = (-width) % pool_size
+        padding = ((0, 0),) * (arrays.ndim - 2) + (
+            (0, pad_height),
+            (0, pad_width),
+        )
+        if pad_height or pad_width:
+            arrays = np.pad(arrays, padding, mode="constant")
+
+        pooled_shape = arrays.shape[:-2] + (
+            arrays.shape[-2] // pool_size,
+            pool_size,
+            arrays.shape[-1] // pool_size,
+            pool_size,
+        )
+        windows = arrays.reshape(pooled_shape)
+        reducer = np.mean if mode == "average" else np.max
+        return reducer(windows, axis=(-3, -1))

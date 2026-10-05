@@ -10,6 +10,15 @@ from .ActFunc import *
 
 CONSOLE = console.Console()
 
+def _xavier_uniform(
+    fan_in: int, fan_out: int, shape: tuple[int, ...] | None = None
+) -> np.ndarray:
+    """Create Xavier-uniform weights for a layer's input and output widths."""
+    limit = np.sqrt(6 / (fan_in + fan_out))
+    return np.random.uniform(
+        -limit, limit, size=shape if shape is not None else (fan_in, fan_out)
+    )
+
 class InitModel:
     def __init__(self):
         self.model: dict[str, np.ndarray] = {}
@@ -35,22 +44,19 @@ class InitModel:
 
         # init convolution
         CONSOLE.print("[INFO]Initializing convolution", style="bold")
-        self.model["conv1"] = np.random.rand(4, 3, 3) # 2x15x15 -> 16x8x8
-        self.model["conv2"] = np.random.rand(8, 3, 3) # 16x8x8 -> 32x4x4 -> view to 1024
+        self.model["conv1"] = _xavier_uniform(2 * 3 * 3, 8 * 3 * 3, (4, 3, 3))
+        self.model["conv2"] = _xavier_uniform(8 * 3 * 3, 64 * 3 * 3, (8, 3, 3))
         CONSOLE.print("[Success]Initialized convolution", style="bold green")
 
         # init network
         CONSOLE.print("[INFO]Initializing network", style="bold")
-        self.model["w0"] = np.random.rand(1024, layers[0])
-        self.model["b0"] = np.random.rand(1, layers[0])
+        self.model["w0"] = _xavier_uniform(1024, layers[0])
+        self.model["b0"] = np.zeros((1, layers[0]))
 
         for i, layer in enumerate(layers):
-            if i != len(layers) - 1:
-              self.model[f"w{i+1}"] = np.random.rand(layer, layers[i+1])
-              self.model[f"b{i+1}"] = np.random.rand(1, layers[i+1])
-            else:
-              self.model[f"w{i+1}"] = np.random.rand(layer, 1)
-              self.model[f"b{i+1}"] = np.random.rand(1, 1)
+            next_layer = layers[i + 1] if i + 1 < len(layers) else 1
+            self.model[f"w{i+1}"] = _xavier_uniform(layer, next_layer)
+            self.model[f"b{i+1}"] = np.zeros((1, next_layer))
 
             CONSOLE.print(f" -Initialized layer {i+1} with {layer} neurons", style="bold")
 
@@ -123,14 +129,16 @@ class InitModel:
     def forward(self, array:np.array):
         """
         Operates the model on the given input
-        return: the Victory percentage of Black chess
+        Accepts one board with shape (2, height, width), or a batch with
+        shape (batch, 2, height, width).
         """
+        batched = array.ndim == 4
         # conv operations
         x = Conv.pooling(Conv.ConvOpe(array, self.model["conv1"]).operation())
         x = ReLU(x)
         x = Conv.pooling(Conv.ConvOpe(x, self.model["conv2"]).operation())
         x = ReLU(x)
-        x = Conv.view1D(x)
+        x = x.reshape(x.shape[0], -1) if batched else Conv.view1D(x)
         # linear operations
         i = 0
         while f"w{i}" in self.model:
@@ -138,7 +146,7 @@ class InitModel:
             x = tanh(x) if f"w{i+1}" in self.model else sigmoid(x)
             i += 1
 
-        return float(x[0, 0])
+        return x if batched else float(x[0, 0])
 
     def OpeOneLayer(self, input:np.array, weight:np.array, bias:np.array):
         """
@@ -146,16 +154,3 @@ class InitModel:
         """
         np.zeros((1, bias.shape[1]))
         return np.matmul(input, weight) + bias
-
-if __name__ == "__main__":
-    model = InitModel()
-    model.CreateModel([256, 128, 64, 32, 16])
-    model.SaveModel(path="./", name="model", others={"test" : "test"})
-    return_code = model.LoadModel(path="./model.gmdl")
-    code = return_code[0]
-    if code != "SUCCESS":
-        CONSOLE.print(f"Error loading model: {return_code[1]}", style="bold red")
-    else:
-        CONSOLE.print("Model loaded successfully", style="bold green")
-        result = model.forward(np.zeros((2, 15, 15)))
-        CONSOLE.print(f"Forward result = {result}", style="bold blue")

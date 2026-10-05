@@ -137,20 +137,25 @@ class TrainModel:
         self._active_genome_id = id(genome)
 
     def _predict_black_win(self, board: np.ndarray, genome: Sequence[float]) -> float:
+        return float(self._predict_black_wins(board[np.newaxis, ...], genome)[0])
+
+    def _predict_black_wins(
+        self, boards: np.ndarray, genome: Sequence[float]
+    ) -> np.ndarray:
         self._activate_genome(genome)
-        output = np.asarray(self.model.forward(board), dtype=float).reshape(-1)
-        if output.size != 1:
+        output = np.asarray(self.model.forward(boards), dtype=float).reshape(-1)
+        if output.size != len(boards):
             raise ValueError(
-                f"model.forward must return one black-win probability; got shape {output.shape}."
+                "model.forward must return one black-win probability per board; "
+                f"got {output.size} probabilities for {len(boards)} boards."
             )
-        probability = float(output[0])
-        if not np.isfinite(probability):
+        if not np.all(np.isfinite(output)):
             raise ValueError("model.forward returned a non-finite win probability.")
-        if not 0 <= probability <= 1:
+        if np.any((output < 0) | (output > 1)):
             raise ValueError(
-                f"model.forward must return a probability in [0, 1]; got {probability}."
+                "model.forward must return probabilities in [0, 1]."
             )
-        return probability
+        return output
 
     def _candidate_moves(self, board: np.ndarray) -> list[tuple[int, int]]:
         occupied = np.any(board != 0, axis=0)
@@ -177,13 +182,24 @@ class TrainModel:
         genome: Sequence[float],
         progress_callback: Callable[[str], None] | None = None,
     ) -> list[tuple[float, tuple[int, int], np.ndarray]]:
-        scored_moves = []
         plane = 0 if is_black else 1
         candidates = self._candidate_moves(board)
-        for index, (row, column) in enumerate(candidates, start=1):
+        if not candidates:
+            return []
+
+        candidate_boards = []
+        for row, column in candidates:
             next_board = board.copy()
             next_board[plane, row, column] = 1
-            black_probability = self._predict_black_win(next_board, genome)
+            candidate_boards.append(next_board)
+        probabilities = self._predict_black_wins(
+            np.stack(candidate_boards), genome
+        )
+
+        scored_moves = []
+        for index, ((row, column), next_board, black_probability) in enumerate(
+            zip(candidates, candidate_boards, probabilities), start=1
+        ):
             player_probability = black_probability if is_black else 1 - black_probability
             scored_moves.append((player_probability, (row, column), next_board))
             if progress_callback is not None:
