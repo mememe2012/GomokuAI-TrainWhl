@@ -23,9 +23,10 @@ class TrainModel:
     """Evolve neural-network weights by playing games against the population.
 
     ``winner_func`` receives a (2, 15, 15) board and returns True for a black
-    win, False for a white win, or None while play continues. ``simulation_budget``
-    limits extra model.forward evaluations per move; initial candidate screening
-    is always completed and does not consume this budget.
+    win, False for a white win, or None while play continues. An optional
+    ``winner_after_move_func`` can check only the newly placed stone for faster
+    evaluation. ``simulation_budget`` limits extra model.forward evaluations
+    per move; initial candidate screening is always completed.
     """
 
     def __init__(
@@ -43,8 +44,29 @@ class TrainModel:
         neighborhood: int = 3,
         max_moves: int = 225,
         mutation_sigma: float = 0.1,
+        policy_pool_size: int = 12,
+        historical_opponent_probability: float = 0.5,
+        elo_weight: float = 0.25,
+        adaptive_mutation: bool = True,
         seed: int | None = None,
+        winner_after_move_func: (
+            Callable[[np.ndarray, tuple[int, int]], bool | None] | None
+        ) = None,
     ):
+        """
+        Args:
+            model (InitModel): Initial model to evolve.
+            gen (int): Number of generations to evolve.
+            pop (int): Number of individuals in the population.
+            cxpb (float): Probability of crossover.
+            mutpb (float): Probability of mutation.
+            mutation_sigma (float): Standard deviation of mutation.
+            matches_per_individual (int): Number of matches per individual.
+            policy_pool_size (int): Maximum number of archived historical policies.
+            historical_opponent_probability (float): Chance to play an archived policy.
+            elo_weight (float): Weight of normalized Elo in selection fitness.
+            adaptive_mutation (bool): Increase mutation when population diversity falls.
+        """
         if gen < 1:
             raise ValueError("gen must be at least 1.")
         if pop < 2:
@@ -63,6 +85,12 @@ class TrainModel:
             raise ValueError("max_moves must be between 1 and 225.")
         if mutation_sigma <= 0:
             raise ValueError("mutation_sigma must be greater than 0.")
+        if policy_pool_size < 1:
+            raise ValueError("policy_pool_size must be at least 1.")
+        if not 0 <= historical_opponent_probability <= 1:
+            raise ValueError("historical_opponent_probability must be between 0 and 1.")
+        if not 0 <= elo_weight <= 1:
+            raise ValueError("elo_weight must be between 0 and 1.")
 
         self.model = model
         self.gen = gen
@@ -71,16 +99,25 @@ class TrainModel:
         self.mutpb = mutpb
         self.back_funk = back_funk
         self.winner_func = winner_func
+        self.winner_after_move_func = winner_after_move_func
         self.simulation_budget = simulation_budget
         self.matches_per_individual = matches_per_individual
         self.win_threshold = win_threshold
         self.neighborhood = neighborhood
         self.max_moves = max_moves
         self.mutation_sigma = mutation_sigma
+        self.policy_pool_size = policy_pool_size
+        self.historical_opponent_probability = historical_opponent_probability
+        self.elo_weight = elo_weight
+        self.adaptive_mutation = adaptive_mutation
         self._rng = random.Random(seed)
+        self._mutation_multiplier = 1.0
         self._active_genome_id: int | None = None
         self.best_individual: list[float] | None = None
         self.best_fitness: float | None = None
+        self.best_win_score: float | None = None
+        self.best_elo_rating: float | None = None
+        self.policy_pool: list[tuple[list[float], float]] = []
 
         if not getattr(model, "model", None):
             raise ValueError(
@@ -107,7 +144,13 @@ class TrainModel:
         individual_name = f"TrainModelIndividual_{suffix}"
         creator.create(fitness_name, base.Fitness, weights=(1.0,))
         fitness_type = getattr(creator, fitness_name)
-        creator.create(individual_name, list, fitness=fitness_type)
+        creator.create(
+            individual_name,
+            list,
+            fitness=fitness_type,
+            win_score=0.0,
+            elo_rating=1000.0,
+        )
         individual_type = getattr(creator, individual_name)
 
         self.toolbox = base.Toolbox()
@@ -187,30 +230,35 @@ class TrainModel:
         if not candidates:
             return []
 
-        candidate_boards = []
-        for row, column in candidates:
-            next_board = board.copy()
-            next_board[plane, row, column] = 1
-            candidate_boards.append(next_board)
+        candidate_boards = np.broadcast_to(
+            board, (len(candidates), *board.shape)
+        ).copy()
+        rows, columns = np.asarray(candidates).T
+        candidate_boards[np.arange(len(candidates)), plane, rows, columns] = 1
         probabilities = self._predict_black_wins(
-            np.stack(candidate_boards), genome
+            candidate_boards, genome
         )
 
         scored_moves = []
-        for index, ((row, column), next_board, black_probability) in enumerate(
-            zip(candidates, candidate_boards, probabilities), start=1
+        for (row, column), next_board, black_probability in zip(
+            candidates, candidate_boards, probabilities
         ):
             player_probability = black_probability if is_black else 1 - black_probability
             scored_moves.append((player_probability, (row, column), next_board))
-            if progress_callback is not None:
-                progress_callback(f"scoring candidates {index}/{len(candidates)}")
+        if progress_callback is not None:
+            progress_callback(f"scored {len(candidates)} candidate moves")
         scored_moves.sort(key=lambda item: item[0], reverse=True)
         return scored_moves
 
-    def _get_winner(self, board: np.ndarray) -> bool | None:
+    def _get_winner(
+        self, board: np.ndarray, last_move: tuple[int, int] | None = None
+    ) -> bool | None:
         if self.winner_func is None:
             raise ValueError("winner_func is required to run self-play training.")
-        winner = self.winner_func(board.copy())
+        if last_move is not None and self.winner_after_move_func is not None:
+            winner = self.winner_after_move_func(board.copy(), last_move)
+        else:
+            winner = self.winner_func(board.copy())
         if winner is not None and not isinstance(winner, (bool, np.bool_)):
             raise TypeError("winner_func must return True, False, or None.")
         return None if winner is None else bool(winner)
@@ -285,13 +333,13 @@ class TrainModel:
         for index, (row, column) in enumerate(candidate_moves, start=1):
             next_board = board.copy()
             next_board[plane, row, column] = 1
-            winner = self._get_winner(next_board)
+            winner = self._get_winner(next_board, (row, column))
             if winner is not None:
                 simulation["score"] = float(winner == original_is_black)
                 simulation["finished"] = True
                 if progress_callback is not None:
                     progress_callback(
-                        f"simulating candidates {index}/{len(candidate_moves)}"
+                        f"simulation found a win among {index} candidate moves"
                     )
                 return True
             if remaining[0] == 0:
@@ -299,10 +347,6 @@ class TrainModel:
 
             probability = self._predict_black_win(next_board, genome)
             remaining[0] -= 1
-            if progress_callback is not None:
-                progress_callback(
-                    f"simulating candidates {index}/{len(candidate_moves)}"
-                )
             score = probability if is_black else 1 - probability
             if score > best_score:
                 best_move = (row, column)
@@ -317,6 +361,10 @@ class TrainModel:
                 return True
             return False
 
+        if progress_callback is not None:
+            progress_callback(
+                f"simulation scored candidates through {index}/{len(candidate_moves)}"
+            )
         simulation["board"] = best_board
         simulation["turn_is_black"] = not is_black
         simulation["score"] = (
@@ -330,7 +378,7 @@ class TrainModel:
         is_black: bool,
     ) -> tuple[int, int] | None:
         for _, move, next_board in scored_moves:
-            if self._get_winner(next_board) is is_black:
+            if self._get_winner(next_board, move) is is_black:
                 return move
         return None
 
@@ -376,7 +424,7 @@ class TrainModel:
                     f"{side} played ({move[0] + 1}, {move[1] + 1})",
                     move_index + 1,
                 )
-            winner = self._get_winner(board)
+            winner = self._get_winner(board, move)
             if winner is not None:
                 if progress_callback is not None:
                     winner_name = "Black" if winner else "White"
@@ -399,6 +447,7 @@ class TrainModel:
         progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> float:
         points = 0.0
+        rating = float(getattr(individual, "elo_rating", 1000.0))
         opponent_indices = [other for other in range(len(population)) if other != index]
 
         for match_index in range(self.matches_per_individual):
@@ -408,8 +457,15 @@ class TrainModel:
                     0,
                     match_index,
                 )
-            opponent_index = self._rng.choice(opponent_indices)
-            opponent = population[opponent_index]
+            use_historical = (
+                self.policy_pool
+                and self._rng.random() < self.historical_opponent_probability
+            )
+            if use_historical:
+                opponent, opponent_rating = self._rng.choice(self.policy_pool)
+            else:
+                opponent = population[self._rng.choice(opponent_indices)]
+                opponent_rating = float(getattr(opponent, "elo_rating", 1000.0))
             individual_is_black = match_index % 2 == 0
             game_progress_callback = (
                 lambda status, moves: progress_callback(
@@ -428,10 +484,16 @@ class TrainModel:
                     opponent, individual, game_progress_callback
                 )
 
-            if winner is None:
-                points += 0.5
-            elif winner == individual_is_black:
-                points += 1.0
+            match_score = (
+                0.5
+                if winner is None
+                else 1.0
+                if winner == individual_is_black
+                else 0.0
+            )
+            points += match_score
+            expected_score = self._elo_probability(opponent_rating - rating)
+            rating += 32 * (match_score - expected_score)
             if progress_callback is not None:
                 result = (
                     "draw"
@@ -445,7 +507,34 @@ class TrainModel:
                     match_index + 1,
                 )
 
-        return points / self.matches_per_individual
+        win_score = points / self.matches_per_individual
+        elo_score = self._elo_probability(1000 - rating)
+        individual.win_score = win_score
+        individual.elo_rating = rating
+        return (1 - self.elo_weight) * win_score + self.elo_weight * elo_score
+
+    @staticmethod
+    def _elo_probability(rating_difference: float) -> float:
+        exponent = min(20.0, max(-20.0, rating_difference / 400))
+        return 1 / (1 + 10**exponent)
+
+    def _population_diversity(self, population: Sequence[Sequence[float]]) -> float:
+        genomes = np.asarray(population, dtype=float)
+        average_spread = float(np.mean(np.std(genomes, axis=0)))
+        average_scale = float(np.mean(np.sqrt(np.mean(np.square(genomes), axis=0))))
+        return average_spread / max(average_scale, 1e-8)
+
+    def _update_policy_pool(self, population: Sequence[Sequence[float]]) -> None:
+        ranked = sorted(
+            population,
+            key=lambda item: item.fitness.values[0],
+            reverse=True,
+        )
+        for individual in ranked[:2]:
+            self.policy_pool.append(
+                (list(individual), float(individual.elo_rating))
+            )
+        self.policy_pool = self.policy_pool[-self.policy_pool_size :]
 
     def _initialize_population(self) -> list[list[float]]:
         population = [self.toolbox.individual(self._base_genome.copy())]
@@ -471,7 +560,10 @@ class TrainModel:
         return first, second
 
     def _mutate(self, individual: list[float]) -> tuple[list[float]]:
-        probability = 1 / len(individual)
+        probability = min(
+            1.0,
+            max(1 / len(individual), 0.01) * self._mutation_multiplier,
+        )
         for index, value in enumerate(individual):
             if self._rng.random() < probability:
                 individual[index] = min(
@@ -500,6 +592,11 @@ class TrainModel:
             )
         if not callable(self.winner_func):
             raise TypeError("winner_func must be callable.")
+        if (
+            self.winner_after_move_func is not None
+            and not callable(self.winner_after_move_func)
+        ):
+            raise TypeError("winner_after_move_func must be callable.")
         if self.back_funk is not None and not callable(self.back_funk):
             raise TypeError("back_funk must be callable.")
 
@@ -580,14 +677,21 @@ class TrainModel:
 
             self.hall_of_fame.update(population)
             best = self.hall_of_fame[0]
-            average_fitness = sum(
-                individual.fitness.values[0] for individual in population
+            generation_best = max(
+                population, key=lambda individual: individual.fitness.values[0]
+            )
+            average_win_score = sum(
+                individual.win_score for individual in population
             ) / len(population)
+            self._update_policy_pool(population)
             CONSOLE.print(
                 f"[green]Generation {generation + 1}/{self.gen} complete[/green] "
                 f"| evaluated: {len(population)} individuals "
-                f"| best win score: {best.fitness.values[0]:.3f} "
-                f"| population average: {average_fitness:.3f}"
+                f"| generation best win score: {generation_best.win_score:.3f} "
+                f"| generation best Elo: {generation_best.elo_rating:.0f} "
+                f"| all-time best win score: {best.win_score:.3f} "
+                f"| all-time best Elo: {best.elo_rating:.0f} "
+                f"| population average win score: {average_win_score:.3f}"
             )
 
             if self.back_funk is not None:
@@ -596,6 +700,16 @@ class TrainModel:
             if generation + 1 == self.gen:
                 break
 
+            diversity = self._population_diversity(population)
+            self._mutation_multiplier = (
+                min(3.0, 1 + 2 * max(0.0, 0.15 - diversity) / 0.15)
+                if self.adaptive_mutation
+                else 1.0
+            )
+            CONSOLE.print(
+                f"[dim]Population diversity: {diversity:.3f} "
+                f"| mutation multiplier: {self._mutation_multiplier:.2f}x[/dim]"
+            )
             elite = self.toolbox.clone(best)
             parents = self.toolbox.select(population, self.pop - 1)
             offspring = [self.toolbox.clone(parent) for parent in parents]
@@ -616,10 +730,13 @@ class TrainModel:
 
         self.best_individual = list(self.hall_of_fame[0])
         self.best_fitness = float(self.hall_of_fame[0].fitness.values[0])
+        self.best_win_score = float(self.hall_of_fame[0].win_score)
+        self.best_elo_rating = float(self.hall_of_fame[0].elo_rating)
         self._active_genome_id = None
         self._activate_genome(self.best_individual)
         CONSOLE.print(
             f"[bold green]Training complete[/bold green] "
-            f"| best win score: {self.best_fitness:.3f}"
+            f"| best win score: {self.best_win_score:.3f} "
+            f"| Elo: {self.best_elo_rating:.0f}"
         )
         return self.model
