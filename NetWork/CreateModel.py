@@ -1,0 +1,161 @@
+import numpy as np
+from rich import console
+from . import Convolution as Conv
+import zipfile
+import json
+import hashlib
+import io
+import os
+from .ActFunc import *
+
+CONSOLE = console.Console()
+
+class InitModel:
+    def __init__(self):
+        self.model: dict[str, np.ndarray] = {}
+
+    def CreateModel(self, layers:list):
+        """
+        Input Layer : 2 * 15 * 15
+        - 0 = empty
+        - 1 = chess
+          - the 1st board = black
+          - the 2nd board = white
+
+        Hidden Layer : layers
+        - index = which layer
+        - lst[index] = number of neurons
+        Output Layer : 1
+        - sigmoid
+        """
+
+        self.model = {}
+
+        CONSOLE.print("[INFO]Initializing model", style="bold")
+
+        # init convolution
+        CONSOLE.print("[INFO]Initializing convolution", style="bold")
+        self.model["conv1"] = np.random.rand(4, 3, 3) # 2x15x15 -> 16x8x8
+        self.model["conv2"] = np.random.rand(8, 3, 3) # 16x8x8 -> 32x4x4 -> view to 1024
+        CONSOLE.print("[Success]Initialized convolution", style="bold green")
+
+        # init network
+        CONSOLE.print("[INFO]Initializing network", style="bold")
+        self.model["w0"] = np.random.rand(1024, layers[0])
+        self.model["b0"] = np.random.rand(1, layers[0])
+
+        for i, layer in enumerate(layers):
+            if i != len(layers) - 1:
+              self.model[f"w{i+1}"] = np.random.rand(layer, layers[i+1])
+              self.model[f"b{i+1}"] = np.random.rand(1, layers[i+1])
+            else:
+              self.model[f"w{i+1}"] = np.random.rand(layer, 1)
+              self.model[f"b{i+1}"] = np.random.rand(1, 1)
+
+            CONSOLE.print(f" -Initialized layer {i+1} with {layer} neurons", style="bold")
+
+        CONSOLE.print("[Success]Model initialized", style="bold green")
+
+    def SaveModel(self, path:str, name:str, others:dict):
+        """
+        Save model to file
+        - others: dict of other information to save
+        """
+        CONSOLE.print("[INFO]Saving model...", style="bold")
+        info = {}
+
+        # create a zip file
+        with zipfile.ZipFile(f"{path}/{name}.gmdl", "w") as zipf:
+          # add the model to the zip file
+          for layer, value in self.model.items():
+            buffer = io.BytesIO()
+            np.save(buffer, value, allow_pickle=False)
+            buffer.seek(0)
+            zipf.writestr(f"{layer}.npy", buffer.read())
+            CONSOLE.print(f" -Saved layer {layer} to file", style="bold")
+
+          # get all npy files hash
+          for file in zipf.namelist():
+              if file.endswith(".npy"):
+                  hash = hashlib.sha1(zipf.read(file)).hexdigest()
+                  info[file] = hash
+
+          info["others"] = others
+
+          # add json file with the info of the model
+          zipf.writestr("info.json", json.dumps(info))
+
+          CONSOLE.print(f"[Success]Saved model to file {name}.gmdl, file size = {os.path.getsize(f'{path}/{name}.gmdl') / 1024 / 1024:.2f} MiB", style="bold green")
+
+    def LoadModel(self, path:str):
+       """
+       Load model from file
+       """
+       self.model = {}
+       # load the info.json file
+       CONSOLE.print("[INFO]Loading metadata file...", style="bold")
+       with zipfile.ZipFile(path, "r") as zipf:
+          if "info.json" not in zipf.namelist():
+              CONSOLE.print(f"[Error]Can not find metadata file.", style="bold red")
+              return ["META ERROR"]
+          else:
+              raw_info = zipf.read("info.json").decode("utf-8")
+              info = json.loads(raw_info)
+              CONSOLE.print(f"[Success]Loaded metadata file.", style="bold green")
+
+          # load the model
+          CONSOLE.print("[INFO]Loading model...", style="bold")
+          for file in zipf.namelist():
+              if file.endswith(".npy"):
+                  if file not in info:
+                      CONSOLE.print(f"[Error]Can not find file {file} in metadata file.", style="bold red")
+                      return ["MODEL ERROR"]
+                  self.model[file.split(".")[0]] = np.load(io.BytesIO(zipf.read(file)), allow_pickle=True)
+                  # check if the hash of the file is the same as the one in the info.json file
+                  if hashlib.sha1(zipf.read(file)).hexdigest() != info[file]:
+                      CONSOLE.print("[Error]The file " + file + " is corrupted", style="bold red")
+                      return ["HASH ERROR"]
+                  CONSOLE.print(f" -Loaded {file}, sha1 = {info[file]}, shape = {self.model[file.split('.')[0]].shape}", style="bold")
+
+          CONSOLE.print("[Success]Model loaded successfully", style="bold green")
+          return ["SUCCESS", info]
+
+    def forward(self, array:np.array):
+        """
+        Operates the model on the given input
+        return: the Victory percentage of Black chess
+        """
+        # conv operations
+        x = Conv.pooling(Conv.ConvOpe(array, self.model["conv1"]).operation())
+        x = ReLU(x)
+        x = Conv.pooling(Conv.ConvOpe(x, self.model["conv2"]).operation())
+        x = ReLU(x)
+        x = Conv.view1D(x)
+        # linear operations
+        i = 0
+        while f"w{i}" in self.model:
+            x = self.OpeOneLayer(x, self.model[f"w{i}"], self.model[f"b{i}"])
+            x = tanh(x) if f"w{i+1}" in self.model else sigmoid(x)
+            i += 1
+
+        return float(x[0, 0])
+
+    def OpeOneLayer(self, input:np.array, weight:np.array, bias:np.array):
+        """
+        Operates one layer of the model on the given input
+        """
+        np.zeros((1, bias.shape[1]))
+        return np.matmul(input, weight) + bias
+
+if __name__ == "__main__":
+    model = InitModel()
+    model.CreateModel([256, 128, 64, 32, 16])
+    model.SaveModel(path="./", name="model", others={"test" : "test"})
+    return_code = model.LoadModel(path="./model.gmdl")
+    code = return_code[0]
+    if code != "SUCCESS":
+        CONSOLE.print(f"Error loading model: {return_code[1]}", style="bold red")
+    else:
+        CONSOLE.print("Model loaded successfully", style="bold green")
+        result = model.forward(np.zeros((2, 15, 15)))
+        CONSOLE.print(f"Forward result = {result}", style="bold blue")
